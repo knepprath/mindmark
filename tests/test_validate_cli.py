@@ -56,8 +56,9 @@ def test_validate_all_healthy_no_prompt(tmp_path, monkeypatch):
     assert rc == 0
 
 
-def test_validate_stale_prompt_yes_trims(tmp_path, monkeypatch):
-    db = tmp_path / "validate_trim.db"
+def test_validate_stale_reports_only(tmp_path, monkeypatch):
+    """Validate identifies stale bookmarks but does not remove them."""
+    db = tmp_path / "validate_report.db"
     stale_url = "https://stale.example.com"
     keep_url = "https://keep.example.com"
     _build_index(
@@ -74,17 +75,22 @@ def test_validate_stale_prompt_yes_trims(tmp_path, monkeypatch):
         return (url, 200, None)
 
     monkeypatch.setattr(cli, "_check_url_status", fake_check)
-    monkeypatch.setattr("builtins.input", lambda _prompt: "y")
+
+    def fail_input(_prompt: str) -> str:
+        raise AssertionError("input() should not be called in read-only validate mode")
+
+    monkeypatch.setattr("builtins.input", fail_input)
 
     args = Namespace(db=db, timeout=0.5, workers=2, yes=False)
     rc = cli._cmd_validate(args)
     assert rc == 0
 
+    # Verify both bookmarks still exist (validate does NOT trim)
     idx = Index(db_path=db)
     try:
         urls = [b["url"] for b in idx.all_bookmarks()]
         assert keep_url in urls
-        assert stale_url not in urls
+        assert stale_url in urls  # Still there after validate
     finally:
         idx.close()
 
@@ -96,11 +102,12 @@ def test_main_validate_dispatch(monkeypatch, tmp_path):
     def fake_validate(args):
         called["ok"] = True
         assert args.db == str(db)
-        assert args.yes is True
+        assert args.timeout == 8.0
+        assert args.workers == 16
         return 0
 
     monkeypatch.setattr(cli, "_cmd_validate", fake_validate)
-    rc = cli.main(["--validate", "--yes", "--db", str(db)])
+    rc = cli.main(["--db", str(db), "validate"])
     assert rc == 0
     assert called["ok"] is True
 
@@ -108,4 +115,10 @@ def test_main_validate_dispatch(monkeypatch, tmp_path):
 def test_main_validate_rejects_subcommand(tmp_path):
     db = tmp_path / "reject.db"
     with pytest.raises(SystemExit):
-        cli.main(["--validate", "--db", str(db), "stats"])
+        cli.main(["validate", "stats", "--db", str(db)])
+
+
+def test_main_validate_rejects_yes(tmp_path):
+    db = tmp_path / "reject_yes.db"
+    with pytest.raises(SystemExit):
+        cli.main(["validate", "--yes", "--db", str(db)])

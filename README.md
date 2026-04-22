@@ -43,7 +43,8 @@ Ask in natural language — mindmark remembers what you saved.
 | `mindmark open "query"` | Search and open the best match in your default browser |
 | `mindmark stats` | Show index size, model info, top domains, and top folders |
 | `mindmark index <file>` | Import bookmarks from an exported HTML file (legacy workflow) |
-| `mindmark --validate` | Check indexed bookmark URLs for stale links and optionally trim them from the local index |
+| `mindmark validate` | Check indexed bookmark URLs for stale links (HTTP 4xx/5xx or unreachable) and report them |
+| `mindmark drop-index` | Delete the local SQLite index database (with confirmation unless `--yes`) |
 
 > 🔌 **Works offline** after the first run. Embeddings run on-device via [fastembed](https://github.com/qdrant/fastembed) (ONNX Runtime, ~130 MB one-time model download).
 
@@ -281,18 +282,27 @@ For the `sync` workflow, just rerun `mindmark sync`. It's incremental — only c
 
 For the `index` workflow, rerun `mindmark index <file>`. It clears and rebuilds the index. The model is cached, so re-indexing 800+ bookmarks takes only seconds.
 
-### Validate stale links
+### Drop the local index
 
-Use `--validate` to probe all indexed HTTP(S) bookmark URLs and report stale ones (HTTP 4xx/5xx or unreachable hosts).
+Use `drop-index` to remove the local SQLite index database when you want a clean slate.
 
 ```bash
-mindmark --validate
-mindmark --validate --yes             # auto-trim stale bookmarks from local index
-mindmark --validate --timeout 5       # per-request timeout in seconds
-mindmark --validate --workers 32      # parallel URL checks
+mindmark drop-index               # asks for confirmation
+mindmark drop-index --yes         # skip confirmation
+mindmark drop-index --db /path/to/index.db
 ```
 
-Non-HTTP URLs (for example `file:` or browser-internal URLs) are skipped.
+### Validate stale links
+
+Use `validate` to probe all indexed HTTP(S) bookmark URLs and identify stale ones (HTTP 4xx/5xx or unreachable hosts). Mindmark will report which bookmarks may be stale and where they are located, but does not modify them. You can then manually remove stale bookmarks from your browser or re-index after cleaning them up.
+
+```bash
+mindmark validate                     # identify all stale bookmarks
+mindmark validate --timeout 5         # per-request timeout in seconds (default 8)
+mindmark validate --workers 32        # parallel URL checks (default 16)
+```
+
+Non-HTTP URLs (for example `file:` or browser-internal URLs) are skipped and not checked.
 
 ### Swap the embedding model
 

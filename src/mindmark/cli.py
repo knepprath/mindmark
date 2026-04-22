@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import os
+import shutil
+import sqlite3
 import sys
 import webbrowser
 from pathlib import Path
@@ -61,7 +63,7 @@ def _cmd_validate(args):
         print(f"validating {total} indexed bookmarks...")
 
         url_to_bm = {b["url"]: b for b in bookmarks}
-        stale: list[tuple[dict, int | None, str | None]] = []
+        stale = []
         skipped = 0
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
@@ -97,23 +99,68 @@ def _cmd_validate(args):
             print(f"   url:    {bm['url']}")
             print(f"   path:   {folder}")
 
-        if not getattr(args, "yes", False):
-            try:
-                ans = input(f"\nRemove {len(stale)} stale bookmarks from index? [y/N] ").strip().lower()
-                if ans != "y":
-                    print("Skipping removal.")
-                    return 0
-            except (EOFError, OSError):
-                return 0
-
-        removed = idx.remove_urls([bm["url"] for bm, _, _ in stale])
-        print(f"Successfully removed {removed} stale bookmarks from index.")
         return 0
     except KeyboardInterrupt:
         print("\n\nCancelled by user.")
         return 1
     finally:
         idx.close()
+
+
+def _cmd_drop_index(args):
+    db_path = Path(args.db).expanduser() if args.db else default_db_path()
+
+    if not db_path.exists():
+        print(f"index not found: {db_path}")
+        return 0
+
+    if not args.yes:
+        try:
+            ans = input(f"drop local index at '{db_path}'? [y/N] ").strip().lower()
+            if ans != "y":
+                print("cancelled.")
+                return 0
+        except (EOFError, OSError):
+            print("cancelled.")
+            return 0
+
+    try:
+        if db_path.is_file():
+            db_path.unlink()
+        elif db_path.is_dir():
+            shutil.rmtree(db_path)
+        else:
+            print(f"index path is not a file or directory: {db_path}")
+            return 1
+    except PermissionError as e:
+        # Windows can keep SQLite files locked by another process handle.
+        # If deletion fails, try clearing index data in-place as a fallback.
+        if db_path.is_file() and _clear_index_contents(db_path):
+            print(f"index file is in use; cleared index contents instead: {db_path}")
+            return 0
+        print(f"error: failed to remove index: {e}", file=sys.stderr)
+        return 1
+    except OSError as e:
+        print(f"error: failed to remove index: {e}", file=sys.stderr)
+        return 1
+
+    print(f"dropped local index: {db_path}")
+    return 0
+
+
+def _clear_index_contents(db_path: Path) -> bool:
+    """Best-effort fallback when index file cannot be deleted due to locks."""
+    try:
+        con = sqlite3.connect(str(db_path), timeout=1.0)
+        cur = con.cursor()
+        cur.execute("DELETE FROM bookmark_sources")
+        cur.execute("DELETE FROM bookmarks")
+        cur.execute("DELETE FROM meta")
+        con.commit()
+        con.close()
+        return True
+    except sqlite3.Error:
+        return False
 
 
 def _cmd_index(args):
@@ -180,25 +227,32 @@ def _cmd_stats(args):
     idx = Index(db_path=args.db)
     try:
         stats = idx.stats()
-        print(f"bookmarks: {stats['count']}")
-        if stats['count'] > 0:
+        print(f"bookmarks: {stats['total']}")
+        if stats['total'] > 0:
             print(f"model:     {stats['model']}")
-            print(f"dimension: {stats['dim']}")
+            if stats['top_domains']:
+                print(f"\ntop domains:")
+                for domain, count in stats['top_domains']:
+                    print(f"  {domain}: {count}")
+            if stats['top_folders']:
+                print(f"\ntop folders:")
+                for folder, count in stats['top_folders']:
+                    print(f"  {folder}: {count}")
         return 0
     finally:
         idx.close()
 
 
 def _cmd_sync(args):
-    from .browsers import collect_all_bookmarks, detect_browsers
+    from .browsers import parse_browser_bookmarks, detect_browsers
     
     browsers = detect_browsers()
     if not browsers:
         print("error: no browsers detected", file=sys.stderr)
         return 1
         
-    print(f"[1/2] collecting bookmarks from {', '.join(b.name for b in browsers)}")
-    bookmarks = collect_all_bookmarks(browsers)
+    print(f"[1/2] collecting bookmarks from {', '.join(b.browser_name for b in browsers)}")
+    bookmarks = []; [bookmarks.extend(parse_browser_bookmarks(b)) for b in browsers]
     if not bookmarks:
         print("no bookmarks found.")
         return 0
@@ -218,28 +272,6 @@ def build_parser():
         description="mindmark — local semantic search over your browser bookmarks.",
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    p.add_argument(
-        "--validate",
-        action="store_true",
-        help="validate indexed bookmark URLs and optionally trim stale entries",
-    )
-    p.add_argument(
-        "--timeout",
-        type=float,
-        default=8.0,
-        help="per-request timeout in seconds for --validate (default: 8.0)",
-    )
-    p.add_argument(
-        "--workers",
-        type=int,
-        default=16,
-        help="parallel request workers for --validate (default: 16)",
-    )
-    p.add_argument(
-        "--yes",
-        action="store_true",
-        help="auto-confirm trimming stale bookmarks during --validate",
-    )
     p.add_argument(
         "--db", default=os.environ.get("MINDMARK_DB"),
         help=f"SQLite index path (default: {default_db_path()})",
@@ -269,20 +301,41 @@ def build_parser():
     py.add_argument("--model", default=DEFAULT_MODEL)
     py.set_defaults(func=_cmd_sync)
 
+    pv = sub.add_parser("validate", help="validate indexed bookmark URLs and report stale entries (read-only)")
+    pv.add_argument(
+        "--timeout",
+        type=float,
+        default=8.0,
+        help="per-request timeout in seconds (default: 8.0)",
+    )
+    pv.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="parallel request workers (default: 16)",
+    )
+    pv.set_defaults(func=_cmd_validate)
+
+    pd = sub.add_parser("drop-index", help="drop (delete) the local index database")
+    pd.add_argument(
+        "--yes",
+        action="store_true",
+        help="auto-confirm index deletion",
+    )
+    pd.set_defaults(func=_cmd_drop_index)
+
     return p
 
 
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.validate:
-        if args.cmd is not None:
-            parser.error("--validate cannot be combined with subcommands")
+    if args.cmd == "validate":
         if args.timeout <= 0:
             parser.error("--timeout must be > 0")
         if args.workers <= 0:
             parser.error("--workers must be > 0")
-        return _cmd_validate(args)
+        return args.func(args)
     if args.cmd is None:
         parser.print_help()
         return 2
