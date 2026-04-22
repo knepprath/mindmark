@@ -407,6 +407,48 @@ class Index:
             "top_folders": top_folders,
         }
 
+    def all_bookmarks(self) -> list[dict]:
+        """Return all indexed bookmarks needed for validation/reporting."""
+        cur = self.con.cursor()
+        cur.row_factory = sqlite3.Row
+        cur.execute(
+            "SELECT url, title, folder_path, domain FROM bookmarks ORDER BY url"
+        )
+        rows = cur.fetchall()
+        return [
+            {
+                "url": r["url"],
+                "title": r["title"],
+                "folder_path": r["folder_path"],
+                "domain": r["domain"],
+            }
+            for r in rows
+        ]
+
+    def remove_urls(self, urls: list[str]) -> int:
+        """Delete bookmarks and source mappings for the given URLs."""
+        if not urls:
+            return 0
+
+        unique_urls = sorted(set(urls))
+        cur = self.con.cursor()
+        placeholders = ",".join("?" for _ in unique_urls)
+        try:
+            cur.execute(
+                f"DELETE FROM bookmark_sources WHERE url IN ({placeholders})",
+                unique_urls,
+            )
+            cur.execute(
+                f"DELETE FROM bookmarks WHERE url IN ({placeholders})",
+                unique_urls,
+            )
+            removed = cur.rowcount
+            self.con.commit()
+            return removed
+        except Exception:
+            self.con.rollback()
+            raise
+
     def _load_matrix(self):
         cur = self.con.cursor()
         cur.row_factory = sqlite3.Row

@@ -2,14 +2,113 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import os
 import sys
 import webbrowser
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request, urlopen
 
 from . import __version__
 from .parser import parse_file
 from .index import Index, SyncResult, default_db_path, DEFAULT_MODEL
+
+
+def _is_http_url(url: str) -> bool:
+    p = urlparse(url)
+    return p.scheme.lower() in {"http", "https"} and bool(p.netloc)
+
+
+def _check_url_status(url: str, timeout: float) -> tuple[str, int | None, str | None]:
+    """Return (url, status_code, error_message)."""
+    if not _is_http_url(url):
+        return url, None, "skipped (non-http URL)"
+
+    headers = {"User-Agent": "mindmark/0.x (+bookmark-validation)"}
+    try:
+        req = Request(url, headers=headers, method="HEAD")
+        with urlopen(req, timeout=timeout) as resp:
+            return url, int(getattr(resp, "status", 0) or 0), None
+    except HTTPError as e:
+        # HTTP errors still include a useful status code.
+        return url, int(e.code), str(e.reason) if e.reason else "HTTP error"
+    except Exception:
+        pass
+
+    # Fallback to GET for servers that reject HEAD.
+    try:
+        req = Request(url, headers=headers, method="GET")
+        with urlopen(req, timeout=timeout) as resp:
+            return url, int(getattr(resp, "status", 0) or 0), None
+    except HTTPError as e:
+        return url, int(e.code), str(e.reason) if e.reason else "HTTP error"
+    except URLError as e:
+        return url, None, str(e.reason) if e.reason else "connection error"
+    except Exception as e:  # pragma: no cover - defensive fallback
+        return url, None, str(e)
+
+
+def _cmd_validate(args):
+    idx = Index(db_path=args.db)
+    try:
+        bookmarks = idx.all_bookmarks()
+        if not bookmarks:
+            print("index is empty — run 'mindmark sync' first.")
+            return 1
+
+        total = len(bookmarks)
+        print(f"validating {total} indexed bookmarks...")
+
+        url_to_bm = {b["url"]: b for b in bookmarks}
+        stale: list[tuple[dict, int | None, str | None]] = []
+        skipped = 0
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as ex:
+            futs = {
+                ex.submit(_check_url_status, b["url"], args.timeout): b["url"]
+                for b in bookmarks
+            }
+            for fut in concurrent.futures.as_completed(futs):
+                url, code, error = fut.result()
+                if error == "skipped (non-http URL)":
+                    skipped += 1
+                    continue
+                if code is None or code >= 400:
+                    stale.append((url_to_bm[url], code, error))
+
+        checked = total - skipped
+        healthy = checked - len(stale)
+
+        print(f"checked={checked} healthy={healthy} stale={len(stale)} skipped={skipped}")
+
+        if not stale:
+            print("all checked bookmarks look valid.")
+            return 0
+
+        print("\nstale bookmarks:")
+        for i, (bm, code, error) in enumerate(stale, 1):
+            reason = f"HTTP {code}" if code is not None else (error or "unreachable")
+            folder = bm["folder_path"] or "(no folder)"
+            print(f"{i:>3}. {reason} | {bm['title']}")
+            print(f"     {bm['url']}")
+            print(f"     ↳ {folder}")
+
+        should_trim = args.yes
+        if not args.yes:
+            answer = input("\nTrim these stale bookmarks from the local index? [y/N]: ").strip().lower()
+            should_trim = answer in {"y", "yes"}
+
+        if not should_trim:
+            print("no changes made.")
+            return 0
+
+        removed = idx.remove_urls([bm["url"] for bm, _code, _error in stale])
+        print(f"trimmed {removed} stale bookmarks from the index.")
+        return 0
+    finally:
+        idx.close()
 
 
 def _cmd_index(args):
@@ -150,11 +249,33 @@ def build_parser():
     )
     p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     p.add_argument(
+        "--validate",
+        action="store_true",
+        help="validate indexed bookmark URLs and optionally trim stale entries",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=8.0,
+        help="per-request timeout in seconds for --validate (default: 8.0)",
+    )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=16,
+        help="parallel request workers for --validate (default: 16)",
+    )
+    p.add_argument(
+        "--yes",
+        action="store_true",
+        help="auto-confirm trimming stale bookmarks during --validate",
+    )
+    p.add_argument(
         "--db", default=os.environ.get("MINDMARK_DB"),
         help=f"SQLite index path (default: {default_db_path()})",
     )
 
-    sub = p.add_subparsers(dest="cmd", required=True)
+    sub = p.add_subparsers(dest="cmd")
 
     pi = sub.add_parser("index", help="build/refresh the index from an exported bookmarks HTML file")
     pi.add_argument("path", help="path to the exported Netscape bookmarks HTML file")
@@ -200,6 +321,17 @@ def build_parser():
 def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.validate:
+        if args.cmd is not None:
+            parser.error("--validate cannot be combined with subcommands")
+        if args.timeout <= 0:
+            parser.error("--timeout must be > 0")
+        if args.workers <= 0:
+            parser.error("--workers must be > 0")
+        return _cmd_validate(args)
+    if args.cmd is None:
+        parser.print_help()
+        return 2
     return args.func(args)
 
 

@@ -43,6 +43,7 @@ Ask in natural language — mindmark remembers what you saved.
 | `mindmark open "query"` | Search and open the best match in your default browser |
 | `mindmark stats` | Show index size, model info, top domains, and top folders |
 | `mindmark index <file>` | Import bookmarks from an exported HTML file (legacy workflow) |
+| `mindmark --validate` | Check indexed bookmark URLs for stale links and optionally trim them from the local index |
 
 > 🔌 **Works offline** after the first run. Embeddings run on-device via [fastembed](https://github.com/qdrant/fastembed) (ONNX Runtime, ~130 MB one-time model download).
 
@@ -279,6 +280,19 @@ mindmark find "useful tools" -k 20                    # return top 20 instead of
 For the `sync` workflow, just rerun `mindmark sync`. It's incremental — only changed bookmarks are re-embedded.
 
 For the `index` workflow, rerun `mindmark index <file>`. It clears and rebuilds the index. The model is cached, so re-indexing 800+ bookmarks takes only seconds.
+
+### Validate stale links
+
+Use `--validate` to probe all indexed HTTP(S) bookmark URLs and report stale ones (HTTP 4xx/5xx or unreachable hosts).
+
+```bash
+mindmark --validate
+mindmark --validate --yes             # auto-trim stale bookmarks from local index
+mindmark --validate --timeout 5       # per-request timeout in seconds
+mindmark --validate --workers 32      # parallel URL checks
+```
+
+Non-HTTP URLs (for example `file:` or browser-internal URLs) are skipped.
 
 ### Swap the embedding model
 
