@@ -1,4 +1,3 @@
-"""Command-line interface for mindmark."""
 from __future__ import annotations
 
 import argparse
@@ -81,32 +80,38 @@ def _cmd_validate(args):
         checked = total - skipped
         healthy = checked - len(stale)
 
-        print(f"checked={checked} healthy={healthy} stale={len(stale)} skipped={skipped}")
+        print(
+            f"checked={checked} healthy={healthy} stale={len(stale)} skipped={skipped}"
+        )
 
         if not stale:
             print("all checked bookmarks look valid.")
             return 0
 
-        print("\nstale bookmarks:")
+        print("\nstale bookmarks found:")
         for i, (bm, code, error) in enumerate(stale, 1):
             reason = f"HTTP {code}" if code is not None else (error or "unreachable")
-            folder = bm["folder_path"] or "(no folder)"
-            print(f"{i:>3}. {reason} | {bm['title']}")
-            print(f"     {bm['url']}")
-            print(f"     ↳ {folder}")
+            folder = bm["folder_path"] or "(root)"
+            print(f"\n{i}. {bm['title']}")
+            print(f"   status: {reason}")
+            print(f"   url:    {bm['url']}")
+            print(f"   path:   {folder}")
 
-        should_trim = args.yes
-        if not args.yes:
-            answer = input("\nTrim these stale bookmarks from the local index? [y/N]: ").strip().lower()
-            should_trim = answer in {"y", "yes"}
+        if not getattr(args, "yes", False):
+            try:
+                ans = input(f"\nRemove {len(stale)} stale bookmarks from index? [y/N] ").strip().lower()
+                if ans != "y":
+                    print("Skipping removal.")
+                    return 0
+            except (EOFError, OSError):
+                return 0
 
-        if not should_trim:
-            print("no changes made.")
-            return 0
-
-        removed = idx.remove_urls([bm["url"] for bm, _code, _error in stale])
-        print(f"trimmed {removed} stale bookmarks from the index.")
+        removed = idx.remove_urls([bm["url"] for bm, _, _ in stale])
+        print(f"Successfully removed {removed} stale bookmarks from index.")
         return 0
+    except KeyboardInterrupt:
+        print("\n\nCancelled by user.")
+        return 1
     finally:
         idx.close()
 
@@ -157,88 +162,53 @@ def _cmd_find(args):
         print(f"opened: {results[n]['title']}")
         return 0
 
-    if args.json:
-        import json
+    import json
+    if getattr(args, "json", False):
         print(json.dumps(results, indent=2))
-        return 0
+    else:
+        for i, r in enumerate(results, 1):
+            domain = urlparse(r["url"]).netloc
+            folder = r["folder_path"]
+            path = f"{folder}/" if folder else ""
+            print(f"{i:2d}. {r['title']}")
+            print(f"    {path}{domain}")
 
-    for i, r in enumerate(results, 1):
-        folder = r["folder_path"] or "(no folder)"
-        print(f"{i:>2}. [{r['score']:.3f}] {r['title']}")
-        print(f"     {r['url']}")
-        print(f"     \u21b3 {folder}")
     return 0
 
 
 def _cmd_stats(args):
     idx = Index(db_path=args.db)
-    s = idx.stats()
-    print(f"db:    {s['db_path']}")
-    print(f"model: {s['model']}")
-    print(f"total: {s['total']} bookmarks")
-    if s["top_domains"]:
-        print("\ntop domains:")
-        for d, c in s["top_domains"]:
-            print(f"  {c:5d}  {d}")
-    if s["top_folders"]:
-        print("\ntop folders:")
-        for f, c in s["top_folders"]:
-            print(f"  {c:5d}  {f}")
-    return 0
-
-
-def _cmd_open(args):
-    idx = Index(db_path=args.db)
-    _auto_sync_hint(idx)
-    results = idx.search(args.query, k=1)
-    if not results:
-        print("no results")
-        return 1
-    webbrowser.open(results[0]["url"])
-    print(f"opened: {results[0]['title']}")
-    return 0
+    try:
+        stats = idx.stats()
+        print(f"bookmarks: {stats['count']}")
+        if stats['count'] > 0:
+            print(f"model:     {stats['model']}")
+            print(f"dimension: {stats['dim']}")
+        return 0
+    finally:
+        idx.close()
 
 
 def _cmd_sync(args):
     from .browsers import collect_all_bookmarks, detect_browsers
-
-    if args.list_browsers:
-        profiles = detect_browsers()
-        if not profiles:
-            print("no supported browsers detected")
-            return 1
-        print(f"{'Browser':<12} {'Profile':<24} Path")
-        print(f"{'-------':<12} {'-------':<24} ----")
-        for p in profiles:
-            print(f"{p.browser_name:<12} {p.profile_name:<24} {p.bookmark_path}")
-        return 0
-
-    print("detecting browsers...")
-    pairs = collect_all_bookmarks(browser_filter=args.browser)
-
-    if not pairs:
-        if args.browser:
-            print(f"no bookmarks found for browser: {args.browser}", file=sys.stderr)
-        else:
-            print("no supported browsers detected", file=sys.stderr)
+    
+    browsers = detect_browsers()
+    if not browsers:
+        print("error: no browsers detected", file=sys.stderr)
         return 1
-
+        
+    print(f"[1/2] collecting bookmarks from {', '.join(b.name for b in browsers)}")
+    bookmarks = collect_all_bookmarks(browsers)
+    if not bookmarks:
+        print("no bookmarks found.")
+        return 0
+    print(f"      found {len(bookmarks)} unique bookmarks")
+    
+    print(f"[2/2] syncing to {args.db or default_db_path()}")
     idx = Index(db_path=args.db, model_name=args.model)
-    total_result = SyncResult()
-
-    for profile, bookmarks in pairs:
-        source_id = profile.source_id
-        print(f"syncing {profile.browser_name} ({profile.profile_name}): "
-              f"{len(bookmarks)} bookmarks...")
-        result = idx.sync(bookmarks, source=source_id, batch_size=args.batch_size)
-        total_result.added += result.added
-        total_result.updated += result.updated
-        total_result.removed += result.removed
-        total_result.unchanged += result.unchanged
-        if result.total_changed > 0:
-            print(f"  {result}")
-
-    print(f"\ndone. {total_result}")
+    res = idx.sync(bookmarks)
+    
+    print(f"done. added={res.added} updated={res.updated} removed={res.removed}")
     return 0
 
 
@@ -295,25 +265,9 @@ def build_parser():
     ps = sub.add_parser("stats", help="show index stats")
     ps.set_defaults(func=_cmd_stats)
 
-    po = sub.add_parser("open", help="search and open the top result in the browser")
-    po.add_argument("query")
-    po.set_defaults(func=_cmd_open)
-
-    psync = sub.add_parser(
-        "sync",
-        help="sync bookmarks directly from installed browsers (no export needed)",
-    )
-    psync.add_argument(
-        "--browser", type=str, default=None,
-        help="sync only this browser (chrome, edge, brave, firefox)",
-    )
-    psync.add_argument(
-        "--list-browsers", action="store_true",
-        help="list detected browsers and profiles, then exit",
-    )
-    psync.add_argument("--model", default=DEFAULT_MODEL)
-    psync.add_argument("--batch-size", type=int, default=64)
-    psync.set_defaults(func=_cmd_sync)
+    py = sub.add_parser("sync", help="automatically sync bookmarks from local browsers")
+    py.add_argument("--model", default=DEFAULT_MODEL)
+    py.set_defaults(func=_cmd_sync)
 
     return p
 
@@ -333,7 +287,3 @@ def main(argv=None):
         parser.print_help()
         return 2
     return args.func(args)
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
