@@ -153,6 +153,7 @@ def _clear_index_contents(db_path: Path) -> bool:
     try:
         con = sqlite3.connect(str(db_path), timeout=1.0)
         cur = con.cursor()
+        cur.execute("DELETE FROM bookmark_enrichment")
         cur.execute("DELETE FROM bookmark_sources")
         cur.execute("DELETE FROM bookmarks")
         cur.execute("DELETE FROM meta")
@@ -192,9 +193,11 @@ def _cmd_find(args):
     idx = Index(db_path=args.db)
     if not getattr(args, 'json', False):
         _auto_sync_hint(idx)
+    include_excerpt = getattr(args, 'excerpt', False)
     results = idx.search(
         query=args.query, k=args.top,
         domain=args.domain, folder=args.folder,
+        include_excerpt=include_excerpt,
     )
     if not results:
         print("no results (is the index empty? run: mindmark sync)")
@@ -219,6 +222,9 @@ def _cmd_find(args):
             path = f"{folder}/" if folder else ""
             print(f"{i:2d}. {r['title']}")
             print(f"    {path}{domain}")
+            if include_excerpt and r.get("relevant_excerpt"):
+                excerpt = r["relevant_excerpt"]
+                print(f"    ⤵ {excerpt}")
 
     return 0
 
@@ -239,6 +245,50 @@ def _cmd_stats(args):
                 for folder, count in stats['top_folders']:
                     print(f"  {folder}: {count}")
         return 0
+    finally:
+        idx.close()
+
+
+def _cmd_enrich(args):
+    from .enricher import enrich_pending
+
+    idx = Index(db_path=args.db)
+    try:
+        pending = idx.pending_enrichment_urls(
+            limit=None if args.refresh_failed else args.limit
+        )
+        if args.refresh_failed:
+            reset = idx.reset_failed_enrichment()
+            if reset:
+                print(f"reset {reset} failed enrichment rows to pending")
+            # re-query after reset, respecting --limit
+            pending = idx.pending_enrichment_urls(limit=args.limit)
+
+        estats = idx.enrichment_stats()
+        total_pending = estats.get("pending", 0)
+
+        if not pending:
+            print("nothing to enrich — run 'mindmark sync' first, or use --refresh-failed")
+            return 0
+
+        to_process = len(pending)
+        print(
+            f"enriching {to_process} bookmarks "
+            f"(pending={total_pending} workers={args.workers} timeout={args.timeout}s)"
+        )
+
+        result = enrich_pending(
+            idx,
+            limit=args.limit,
+            workers=args.workers,
+            timeout=args.timeout,
+            refresh_failed=False,  # already handled above
+        )
+        print(f"done. {result}")
+        return 0
+    except KeyboardInterrupt:
+        print("\n\nCancelled by user.")
+        return 1
     finally:
         idx.close()
 
@@ -292,6 +342,10 @@ def build_parser():
     pf.add_argument("--folder")
     pf.add_argument("--json", action="store_true")
     pf.add_argument("--open", type=int, metavar="N")
+    pf.add_argument(
+        "--excerpt", action="store_true",
+        help="include excerpt from enriched page content (requires mindmark enrich)",
+    )
     pf.set_defaults(func=_cmd_find)
 
     ps = sub.add_parser("stats", help="show index stats")
@@ -324,6 +378,28 @@ def build_parser():
     )
     pd.set_defaults(func=_cmd_drop_index)
 
+    pe = sub.add_parser(
+        "enrich",
+        help="fetch page content for bookmarks and build summary embeddings (local, no cloud)",
+    )
+    pe.add_argument(
+        "--limit", type=int, default=None,
+        help="max bookmarks to process per run (default: all pending)",
+    )
+    pe.add_argument(
+        "--workers", type=int, default=8,
+        help="parallel fetch workers (default: 8)",
+    )
+    pe.add_argument(
+        "--timeout", type=float, default=10.0,
+        help="per-request fetch timeout in seconds (default: 10.0)",
+    )
+    pe.add_argument(
+        "--refresh-failed", action="store_true",
+        help="retry previously failed enrichments",
+    )
+    pe.set_defaults(func=_cmd_enrich)
+
     return p
 
 
@@ -335,6 +411,12 @@ def main(argv=None):
             parser.error("--timeout must be > 0")
         if args.workers <= 0:
             parser.error("--workers must be > 0")
+        return args.func(args)
+    if args.cmd == "enrich":
+        if args.workers <= 0:
+            parser.error("--workers must be > 0")
+        if args.timeout <= 0:
+            parser.error("--timeout must be > 0")
         return args.func(args)
     if args.cmd is None:
         parser.print_help()

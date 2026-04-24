@@ -41,6 +41,7 @@ Ask in natural language — mindmark remembers what you saved.
 | `mindmark sync` | **Auto-detect** installed browsers and sync bookmarks directly — no export needed |
 | `mindmark find "query"` | Semantic search over titles, folders, domains, and URL slugs — returns top-K with similarity scores |
 | `mindmark open "query"` | Search and open the best match in your default browser |
+| `mindmark enrich` | Fetch page content, extract text, embed summaries, and improve search relevance with page context |
 | `mindmark stats` | Show index size, model info, top domains, and top folders |
 | `mindmark index <file>` | Import bookmarks from an exported HTML file (legacy workflow) |
 | `mindmark validate` | Check indexed bookmark URLs for stale links (HTTP 4xx/5xx or unreachable) and report them |
@@ -266,7 +267,7 @@ When you add new bookmarks in your browser, just run `mindmark sync` again — i
 
 > 💡 **Note:** If you change the embedding model with `--model`, all bookmarks will be re-embedded on the next sync. Browser names are case-insensitive (e.g., `--browser Chrome` and `--browser chrome` both work).
 
-### Filters
+### Filters and options
 
 Narrow down results without changing your query:
 
@@ -274,7 +275,10 @@ Narrow down results without changing your query:
 mindmark find "useful tools" --domain github.com     # only github.com results
 mindmark find "useful tools" --folder work/kusto      # only bookmarks in matching folders
 mindmark find "useful tools" -k 20                    # return top 20 instead of 10
+mindmark find "useful tools" --excerpt               # include excerpts from enriched pages
 ```
+
+> 💡 **Note:** The `--excerpt` flag requires you to run `mindmark enrich` first to fetch and embed page content. See [Augmented Index](#-augmented-index-page-summaries) for details.
 
 ### Re-indexing
 
@@ -344,7 +348,90 @@ Browser data files                              "python async tutorial"
 
 ---
 
-## 🗂️ Storage Layout
+## 🎯 Augmented Index with Page Summaries
+
+By default, mindmark indexes only bookmark metadata: titles, folders, domains, and URL slugs. If you want **deeper page context** in search results, use the enrichment pipeline to fetch page content and embed summaries.
+
+> 💡 **Note:** In order to be 100% local and lightweight enrichment uses **extractive summarization** (first 500 chars of page text) — no LLM, no text generation. This means:
+> - Only the opening content is embedded (relevant if key info is early; may miss content further down)
+> - Page content must already be well-written for excerpts to be useful (relies on natural sentence structure)
+> - Privacy and speed are preserved (no cloud calls, runs entirely locally) 
+
+### Why enrich?
+
+Without enrichment, searching for **"authentication strategies"** on a bookmark titled **"AWS Services"** may miss it, even though the page discusses authentication. With enrichment, the page content is fetched and summarized, improving relevance.
+
+### Quick start
+
+1. **Enrich bookmarks** (fetch page content and embed summaries):
+
+```bash
+mindmark enrich --limit 100 --workers 4
+```
+
+Options:
+- `--limit N` — Process top N pending URLs (default: all)
+- `--workers N` — Parallel fetch workers (default: 8)
+- `--timeout S` — Per-request timeout in seconds (default: 10.0)
+- `--refresh-failed` — Retry previously failed enrichments
+
+2. **Search with page context**:
+
+```bash
+mindmark find "authentication strategies" --excerpt
+```
+
+With `--excerpt`, results display the most relevant excerpt from the enriched page:
+
+```
+ 1. AWS Services
+    aws.amazon.com
+    ⤵ To control user access to AWS resources, you must have an authentication strategy. AWS IAM provides fine-grained access control...
+
+ 2. Auth0 Documentation
+    auth0.com
+    ⤵ Authentication is the process of verifying the identity of a user or service. Authorization is the process of granting permissions...
+```
+
+The `⤵` symbol indicates content from the enriched page. Without enrichment, the symbol won't appear.
+
+### How it works
+
+1. **Fetch** — GET each bookmark URL with a user-agent, respecting HTTP 4xx/5xx and content-type guards.
+2. **Extract** — Strip boilerplate (nav, footer, scripts, styles) and extract plain text.
+3. **Summarize** — Use the first 500 characters of extracted text as the summary (extractive, no LLM).
+4. **Embed** — Embed the summary using the same ONNX model as bookmark metadata.
+5. **Blend** — At search time, combine base (bookmark metadata) and summary similarity scores:
+   - **Blended score = 0.65 × base_score + 0.35 × summary_score**
+   - Falls back to base-only if no summary exists.
+6. **Excerpt** — For readability, find and display the sentence from the summary most similar to the query.
+
+### Status and monitoring
+
+Check enrichment status:
+
+```bash
+python -c "
+from mindmark.index import Index
+idx = Index()
+print(idx.enrichment_stats())
+idx.close()
+"
+```
+
+Example output:
+```python
+{'pending': 1234, 'complete': 450, 'failed': 23}
+```
+
+### Notes
+
+- **100% local** — Page fetching happens on your machine; no cloud service is used.
+- **Smart caching** — Pages are re-fetched only if the page content changes (detected via content hash).
+- **Failure resilience** — HTTP errors, timeouts, and JavaScript-only pages are logged as failed; sync and search continue without interruption.
+- **Privacy** — No content leaves your machine; all processing is offline and local.
+
+---
 
 | What | macOS / Linux | Windows | Override |
 |---|---|---|---|

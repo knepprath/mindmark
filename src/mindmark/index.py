@@ -13,7 +13,7 @@ from .parser import Bookmark
 
 DEFAULT_MODEL = "BAAI/bge-small-en-v1.5"
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 def default_db_path() -> Path:
@@ -53,13 +53,31 @@ CREATE TABLE IF NOT EXISTS bookmark_sources (
     content_hash TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (url, source)
 );
+CREATE TABLE IF NOT EXISTS bookmark_enrichment (
+    url TEXT PRIMARY KEY,
+    status TEXT NOT NULL DEFAULT 'pending',
+    page_content_hash TEXT NOT NULL DEFAULT '',
+    summary_text TEXT,
+    summary_embedding BLOB,
+    summary_dim INTEGER,
+    summary_model TEXT,
+    llm_model TEXT,
+    fetched_at INTEGER,
+    summarized_at INTEGER,
+    error TEXT,
+    http_status INTEGER
+);
 CREATE INDEX IF NOT EXISTS idx_bookmarks_domain ON bookmarks(domain);
 CREATE INDEX IF NOT EXISTS idx_bookmarks_folder ON bookmarks(folder_path);
+CREATE INDEX IF NOT EXISTS idx_enrichment_status
+ON bookmark_enrichment(status);
+CREATE INDEX IF NOT EXISTS idx_enrichment_summarized_at
+ON bookmark_enrichment(summarized_at);
 """
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
-    con = sqlite3.connect(db_path)
+    con = sqlite3.connect(db_path, check_same_thread=False)
     con.executescript(_SCHEMA)
     _migrate(con)
     return con
@@ -90,7 +108,38 @@ def _migrate(con: sqlite3.Connection) -> None:
         """)
         cur.execute(
             "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
-            (str(_SCHEMA_VERSION),),
+            ("2",),
+        )
+        con.commit()
+
+    if version < 3:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS bookmark_enrichment (
+                url TEXT PRIMARY KEY,
+                status TEXT NOT NULL DEFAULT 'pending',
+                page_content_hash TEXT NOT NULL DEFAULT '',
+                summary_text TEXT,
+                summary_embedding BLOB,
+                summary_dim INTEGER,
+                summary_model TEXT,
+                llm_model TEXT,
+                fetched_at INTEGER,
+                summarized_at INTEGER,
+                error TEXT,
+                http_status INTEGER
+            )
+        """)
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_enrichment_status "
+            "ON bookmark_enrichment(status)"
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_enrichment_summarized_at "
+            "ON bookmark_enrichment(summarized_at)"
+        )
+        cur.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('schema_version', ?)",
+            ("3",),
         )
         con.commit()
 
@@ -107,6 +156,76 @@ def _l2_normalize(mat: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(mat, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     return mat / norms
+
+
+def _find_relevant_excerpt(
+    query_embedding: np.ndarray,
+    summary_text: str,
+    embedder: "object",
+) -> str:
+    """Find the most relevant sentence(s) in summary text for the query.
+
+    Splits summary into sentences, embeds each, finds the most similar to
+    the query embedding, and returns that sentence with surrounding context
+    (max 200 chars total).
+
+    Parameters
+    ----------
+    query_embedding : np.ndarray
+        Normalized embedding of the search query.
+    summary_text : str
+        Full extracted summary text (up to 500 chars).
+    embedder : object
+        BGE/MiniLM embedder with embed_one() method.
+
+    Returns
+    -------
+    str
+        Most relevant sentence with surrounding context, or first 150 chars
+        if sentence detection fails.
+    """
+    if not summary_text or not summary_text.strip():
+        return ""
+
+    # Split on sentence boundaries (., !, ?)
+    sentences = []
+    current = []
+    for char in summary_text:
+        current.append(char)
+        if char in ".!?":
+            s = "".join(current).strip()
+            if s and len(s) > 3:  # Skip very short fragments
+                sentences.append(s)
+            current = []
+    if current:
+        s = "".join(current).strip()
+        if s and len(s) > 3:
+            sentences.append(s)
+
+    if not sentences:
+        # Fallback: return first 150 chars if no sentences found
+        return summary_text[:150]
+
+    # If only one sentence, return it (up to 200 chars)
+    if len(sentences) == 1:
+        return sentences[0][:200]
+
+    # Embed each sentence and find most similar to query
+    try:
+        sentence_embeddings = embedder.embed(sentences)
+        similarities = sentence_embeddings @ query_embedding
+        best_idx = int(np.argmax(similarities))
+    except Exception:
+        # Fallback if embedding fails
+        return sentences[0][:200]
+
+    # Return best sentence + surrounding context (up to 200 chars)
+    best_sentence = sentences[best_idx]
+    if len(best_sentence) <= 200:
+        return best_sentence
+    # Truncate with ellipsis
+    return best_sentence[:197] + "..."
+
 
 
 @dataclass
@@ -165,6 +284,21 @@ class Index:
     def close(self) -> None:
         """Close the underlying database connection."""
         self.con.close()
+
+    def _queue_enrichment_pending(self, cur: sqlite3.Cursor, urls: set[str]) -> None:
+        """Mark URLs for content-enrichment work."""
+        if not urls:
+            return
+        cur.executemany(
+            """
+            INSERT INTO bookmark_enrichment (url, status)
+            VALUES (?, 'pending')
+            ON CONFLICT(url) DO UPDATE SET
+                status='pending',
+                error=NULL
+            """,
+            [(u,) for u in sorted(urls)],
+        )
 
     def is_empty(self) -> bool:
         cur = self.con.cursor()
@@ -300,6 +434,8 @@ class Index:
                     (h, url, source),
                 )
 
+            self._queue_enrichment_pending(cur, to_embed_urls)
+
             # Delete bookmarks removed from this source
             for url in to_delete_urls:
                 cur.execute(
@@ -312,6 +448,7 @@ class Index:
                 )
                 if cur.fetchone()[0] == 0:
                     cur.execute("DELETE FROM bookmarks WHERE url=?", (url,))
+                    cur.execute("DELETE FROM bookmark_enrichment WHERE url=?", (url,))
 
             result.removed = len(to_delete_urls)
             self.con.commit()
@@ -339,6 +476,7 @@ class Index:
                 )
                 if cur.fetchone()[0] == 0:
                     cur.execute("DELETE FROM bookmarks WHERE url=?", (url,))
+                    cur.execute("DELETE FROM bookmark_enrichment WHERE url=?", (url,))
             self.con.commit()
         except Exception:
             self.con.rollback()
@@ -349,6 +487,7 @@ class Index:
         cur = self.con.cursor()
         cur.execute("DELETE FROM bookmarks")
         cur.execute("DELETE FROM bookmark_sources")
+        cur.execute("DELETE FROM bookmark_enrichment")
         cur.execute("INSERT OR REPLACE INTO meta(key, value) VALUES ('model', ?)", (self.model_name,))
         self.con.commit()
 
@@ -381,6 +520,7 @@ class Index:
             "VALUES (?,?,?)",
             source_rows,
         )
+        self._queue_enrichment_pending(cur, {r[0] for r in rows})
         self.con.commit()
         return {"indexed": total, "model": self.model_name, "dim": rows[0][-2]}
 
@@ -425,6 +565,113 @@ class Index:
             for r in rows
         ]
 
+    # ------------------------------------------------------------------
+    # Enrichment helpers
+    # ------------------------------------------------------------------
+
+    def pending_enrichment_urls(self, limit: int | None = None) -> list[str]:
+        """Return URLs whose enrichment status is 'pending'."""
+        cur = self.con.cursor()
+        if limit is not None and limit > 0:
+            cur.execute(
+                "SELECT url FROM bookmark_enrichment WHERE status='pending' LIMIT ?",
+                (limit,),
+            )
+        else:
+            cur.execute("SELECT url FROM bookmark_enrichment WHERE status='pending'")
+        return [r[0] for r in cur.fetchall()]
+
+    def reset_failed_enrichment(self) -> int:
+        """Mark all 'failed' enrichment rows back to 'pending' for retry."""
+        cur = self.con.cursor()
+        try:
+            cur.execute(
+                "UPDATE bookmark_enrichment SET status='pending', error=NULL "
+                "WHERE status='failed'"
+            )
+            count = cur.rowcount
+            self.con.commit()
+            return count
+        except Exception:
+            self.con.rollback()
+            raise
+
+    def save_enrichment(
+        self,
+        url: str,
+        summary_text: str,
+        summary_embedding: "np.ndarray",
+        model_name: str,
+        content_hash: str,
+        http_status: int | None,
+        summarized_at: int,
+        fetched_at: int,
+    ) -> None:
+        """Persist a successful enrichment result."""
+        vec_blob = _vec_to_blob(summary_embedding)
+        dim = int(summary_embedding.shape[0])
+        cur = self.con.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE bookmark_enrichment SET
+                    status='complete',
+                    page_content_hash=?,
+                    summary_text=?,
+                    summary_embedding=?,
+                    summary_dim=?,
+                    summary_model=?,
+                    http_status=?,
+                    fetched_at=?,
+                    summarized_at=?,
+                    error=NULL
+                WHERE url=?
+                """,
+                (
+                    content_hash, summary_text, vec_blob, dim,
+                    model_name, http_status, fetched_at, summarized_at,
+                    url,
+                ),
+            )
+            self.con.commit()
+        except Exception:
+            self.con.rollback()
+            raise
+
+    def fail_enrichment(
+        self,
+        url: str,
+        error: str,
+        http_status: int | None = None,
+        fetched_at: int | None = None,
+    ) -> None:
+        """Record a fetch/extraction failure for a URL."""
+        cur = self.con.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE bookmark_enrichment SET
+                    status='failed',
+                    error=?,
+                    http_status=?,
+                    fetched_at=?
+                WHERE url=?
+                """,
+                (error, http_status, fetched_at, url),
+            )
+            self.con.commit()
+        except Exception:
+            self.con.rollback()
+            raise
+
+    def enrichment_stats(self) -> dict:
+        """Return a summary of enrichment table status counts."""
+        cur = self.con.cursor()
+        cur.execute(
+            "SELECT status, COUNT(*) FROM bookmark_enrichment GROUP BY status"
+        )
+        return dict(cur.fetchall())
+
     def remove_urls(self, urls: list[str]) -> int:
         """Delete bookmarks and source mappings for the given URLs."""
         if not urls:
@@ -443,6 +690,10 @@ class Index:
                 unique_urls,
             )
             removed = cur.rowcount
+            cur.execute(
+                f"DELETE FROM bookmark_enrichment WHERE url IN ({placeholders})",
+                unique_urls,
+            )
             self.con.commit()
             return removed
         except Exception:
@@ -465,14 +716,68 @@ class Index:
             mat[i] = _blob_to_vec(r["embedding"], dim)
         return mat, rows
 
+    def _load_enrichments(self) -> dict:
+        """Load all complete enrichments as url -> (embedding, text, dim)."""
+        enrichments = {}
+        cur = self.con.cursor()
+        cur.execute(
+            "SELECT url, summary_embedding, summary_text, summary_dim "
+            "FROM bookmark_enrichment WHERE status='complete' AND summary_embedding IS NOT NULL"
+        )
+        for url, embedding_blob, summary_text, dim in cur.fetchall():
+            if embedding_blob and dim:
+                vec = _blob_to_vec(embedding_blob, dim)
+                enrichments[url] = (vec, summary_text, dim)
+        return enrichments
+
     def search(self, query: str, k: int = 10, domain: str | None = None,
-               folder: str | None = None) -> list[dict]:
+               folder: str | None = None, include_excerpt: bool = False) -> list[dict]:
+        """Search bookmarks by query, with optional summary blending.
+
+        Blends base bookmark embedding similarity with summary embedding
+        similarity (when available) using weights: 0.65 * base + 0.35 * summary.
+
+        Parameters
+        ----------
+        query : str
+            Search query text.
+        k : int
+            Maximum number of results.
+        domain : str, optional
+            Filter by domain substring.
+        folder : str, optional
+            Filter by folder substring.
+        include_excerpt : bool
+            If True, include relevant excerpt from summary_text in results.
+
+        Returns
+        -------
+        list[dict]
+            List of results with keys: url, title, folder_path, domain,
+            score (blended if summary available). If include_excerpt=True,
+            also includes 'relevant_excerpt' key.
+        """
         mat, rows = self._load_matrix()
         if len(rows) == 0:
             return []
+
         q = self.embedder.embed_one(query)
-        sims = mat @ q
-        order = np.argsort(-sims)
+        base_sims = mat @ q
+
+        # Load complete enrichments for summary blending
+        enrichments = self._load_enrichments()
+
+        # Compute blended scores for each bookmark
+        blended_sims = np.array(base_sims, copy=True)
+        for idx, r in enumerate(rows):
+            url = r["url"]
+            if url in enrichments:
+                summary_embedding, summary_text, summary_dim = enrichments[url]
+                summary_sim = float(np.dot(summary_embedding, q))
+                # Blend: 0.65 * base + 0.35 * summary
+                blended_sims[idx] = 0.65 * base_sims[idx] + 0.35 * summary_sim
+
+        order = np.argsort(-blended_sims)
         results: list[dict] = []
         for idx in order:
             r = rows[int(idx)]
@@ -480,13 +785,19 @@ class Index:
                 continue
             if folder and folder.lower() not in r["folder_path"].lower():
                 continue
-            results.append({
-                "score": float(sims[int(idx)]),
+            result = {
+                "score": float(blended_sims[int(idx)]),
                 "title": r["title"],
                 "url": r["url"],
                 "folder_path": r["folder_path"],
                 "domain": r["domain"],
-            })
+            }
+            if include_excerpt and r["url"] in enrichments:
+                summary_text = enrichments[r["url"]][1]
+                # Find and include the most relevant excerpt for the query
+                if summary_text:
+                    result["relevant_excerpt"] = _find_relevant_excerpt(q, summary_text, self.embedder)
+            results.append(result)
             if len(results) >= k:
                 break
         return results

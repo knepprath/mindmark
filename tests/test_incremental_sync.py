@@ -181,6 +181,51 @@ def test_schema_migration_on_old_db(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
         assert "bookmark_sources" in tables
+        assert "bookmark_enrichment" in tables
+
+        cur.execute("SELECT value FROM meta WHERE key='schema_version'")
+        assert cur.fetchone()[0] == "3"
+    finally:
+        idx.close()
+
+
+def test_schema_v2_db_migrates_to_v3(tmp_path):
+    """Ensure opening a v2 database adds enrichment table and bumps version."""
+    db_path = tmp_path / "v2.db"
+    con = sqlite3.connect(db_path)
+    con.executescript("""
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE bookmarks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            url TEXT UNIQUE NOT NULL,
+            title TEXT NOT NULL,
+            folder_path TEXT NOT NULL,
+            domain TEXT NOT NULL,
+            add_date INTEGER NOT NULL,
+            icon TEXT,
+            embedding BLOB NOT NULL,
+            dim INTEGER NOT NULL,
+            content_hash TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE bookmark_sources (
+            url TEXT NOT NULL,
+            source TEXT NOT NULL,
+            content_hash TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (url, source)
+        );
+        INSERT INTO meta(key, value) VALUES ('schema_version', '2');
+    """)
+    con.close()
+
+    idx = Index(db_path=db_path)
+    try:
+        cur = idx.con.cursor()
+        tables = {r[0] for r in cur.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        assert "bookmark_enrichment" in tables
+        cur.execute("SELECT value FROM meta WHERE key='schema_version'")
+        assert cur.fetchone()[0] == "3"
     finally:
         idx.close()
 
@@ -214,6 +259,22 @@ def test_rebuild_populates_bookmark_sources(idx):
     assert rows[1] == ("https://b.com", "html")
 
 
+def test_rebuild_marks_enrichment_pending(idx):
+    bms = [
+        _make_bookmark("https://a.com", "A"),
+        _make_bookmark("https://b.com", "B"),
+    ]
+    idx.rebuild(bms)
+
+    cur = idx.con.cursor()
+    cur.execute("SELECT url, status FROM bookmark_enrichment ORDER BY url")
+    rows = cur.fetchall()
+    assert rows == [
+        ("https://a.com", "pending"),
+        ("https://b.com", "pending"),
+    ]
+
+
 def test_rebuild_clears_previous_data(idx):
     """rebuild() should clear old bookmarks and sources before inserting."""
     idx.rebuild([_make_bookmark("https://old.com", "Old")])
@@ -225,6 +286,8 @@ def test_rebuild_clears_previous_data(idx):
     cur.execute("SELECT url FROM bookmarks")
     assert cur.fetchone()[0] == "https://new.com"
     cur.execute("SELECT COUNT(*) FROM bookmark_sources")
+    assert cur.fetchone()[0] == 1
+    cur.execute("SELECT COUNT(*) FROM bookmark_enrichment")
     assert cur.fetchone()[0] == 1
 
 
@@ -320,6 +383,44 @@ def test_search_k_limit(idx):
     assert len(results) == 5
 
 
+def test_sync_adds_enrichment_pending_for_changed_urls(idx):
+    bms = [
+        _make_bookmark("https://a.com", "A"),
+        _make_bookmark("https://b.com", "B"),
+    ]
+    idx.sync(bms, source="test")
+
+    cur = idx.con.cursor()
+    cur.execute("SELECT url, status FROM bookmark_enrichment ORDER BY url")
+    rows = cur.fetchall()
+    assert rows == [
+        ("https://a.com", "pending"),
+        ("https://b.com", "pending"),
+    ]
+
+
+def test_sync_removes_enrichment_when_bookmark_orphaned(idx):
+    bms = [_make_bookmark("https://a.com", "A")]
+    idx.sync(bms, source="chrome:Default")
+    idx.sync([], source="chrome:Default")
+
+    cur = idx.con.cursor()
+    cur.execute("SELECT COUNT(*) FROM bookmark_enrichment WHERE url = ?", ("https://a.com",))
+    assert cur.fetchone()[0] == 0
+
+
+def test_remove_urls_also_clears_enrichment(idx):
+    bms = [_make_bookmark("https://a.com", "A")]
+    idx.rebuild(bms)
+
+    removed = idx.remove_urls(["https://a.com"])
+    assert removed == 1
+
+    cur = idx.con.cursor()
+    cur.execute("SELECT COUNT(*) FROM bookmark_enrichment WHERE url = ?", ("https://a.com",))
+    assert cur.fetchone()[0] == 0
+
+
 # ---- _remove_source() tests ----
 
 def test_remove_source_cleans_orphans(idx):
@@ -337,3 +438,331 @@ def test_remove_source_preserves_other_sources(idx):
 
     idx._remove_source("chrome:Default")
     assert not idx.is_empty()  # firefox still references it
+
+
+# ---- Phase 4: Search Fusion with Summary Blending ----
+
+class TestSearchFusion:
+    def test_search_with_excerpt(self, idx):
+        """include_excerpt flag adds relevant_excerpt to results."""
+        bms = [_make_bookmark("https://a.com", "A")]
+        idx.sync(bms, source="test")
+
+        # Manually add a complete enrichment
+        summary_text = "This is a test summary of the page content."
+        test_vec = np.ones(4, dtype=np.float32) / 2.0
+        idx.save_enrichment(
+            url="https://a.com",
+            summary_text=summary_text,
+            summary_embedding=test_vec,
+            model_name="test-model",
+            content_hash="testhash",
+            http_status=200,
+            fetched_at=123,
+            summarized_at=124,
+        )
+
+        results = idx.search("a", include_excerpt=True)
+        assert len(results) >= 1
+        assert "relevant_excerpt" in results[0]
+
+    def test_search_without_excerpt_flag_omits_it(self, idx):
+        """include_excerpt=False does not add relevant_excerpt."""
+        bms = [_make_bookmark("https://a.com", "A")]
+        idx.sync(bms, source="test")
+
+        summary_text = "This is a test summary."
+        test_vec = np.ones(4, dtype=np.float32) / 2.0
+        idx.save_enrichment(
+            url="https://a.com",
+            summary_text=summary_text,
+            summary_embedding=test_vec,
+            model_name="test-model",
+            content_hash="testhash",
+            http_status=200,
+            fetched_at=123,
+            summarized_at=124,
+        )
+
+        results = idx.search("a", include_excerpt=False)
+        assert len(results) >= 1
+        assert "relevant_excerpt" not in results[0]
+
+    def test_search_with_excerpt_generates_sentence(self, idx):
+        """Excerpt extraction finds most relevant sentence."""
+        bms = [_make_bookmark("https://a.com", "A")]
+        idx.sync(bms, source="test")
+
+        # Long summary
+        summary_text = "x" * 200
+        test_vec = np.ones(4, dtype=np.float32) / 2.0
+        idx.save_enrichment(
+            url="https://a.com",
+            summary_text=summary_text,
+            summary_embedding=test_vec,
+            model_name="test-model",
+            content_hash="testhash",
+            http_status=200,
+            fetched_at=123,
+            summarized_at=124,
+        )
+
+        results = idx.search("a", include_excerpt=True)
+        assert len(results) >= 1
+        # Should have relevant_excerpt (from sentence extraction)
+        assert "relevant_excerpt" in results[0]
+
+    def test_blended_score_computation(self, idx):
+        """Verify blended score = 0.65*base + 0.35*summary."""
+        bms = [_make_bookmark("https://example.com", "Example")]
+        idx.sync(bms, source="test")
+
+        # Add a summary embedding
+        summary_vec = np.array([0.5, 0.5, 0.5, 0.5], dtype=np.float32)
+        summary_vec /= np.linalg.norm(summary_vec)
+        idx.save_enrichment(
+            url="https://example.com",
+            summary_text="test summary",
+            summary_embedding=summary_vec,
+            model_name="test-model",
+            content_hash="testhash",
+            http_status=200,
+            fetched_at=123,
+            summarized_at=124,
+        )
+
+        # Search and get score
+        results = idx.search("example", k=1)
+        assert len(results) == 1
+        blended = results[0]["score"]
+        assert -1 <= blended <= 1
+
+    def test_search_respects_domain_filter_with_summaries(self, idx):
+        """Domain filter works alongside summary blending."""
+        bms = [
+            _make_bookmark("https://a.com", "A"),
+            _make_bookmark("https://b.com", "B"),
+        ]
+        idx.sync(bms, source="test")
+
+        # Add summaries to both
+        test_vec = np.ones(4, dtype=np.float32) / 2.0
+        for url in ["https://a.com", "https://b.com"]:
+            idx.save_enrichment(
+                url=url,
+                summary_text="summary",
+                summary_embedding=test_vec,
+                model_name="test-model",
+                content_hash="hash",
+                http_status=200,
+                fetched_at=123,
+                summarized_at=124,
+            )
+
+        # Filter by domain
+        results = idx.search("", domain="b.com")
+        assert all("b.com" in r["domain"] for r in results)
+
+    def test_search_respects_folder_filter_with_summaries(self, idx):
+        """Folder filter works alongside summary blending."""
+        bms = [
+            _make_bookmark("https://a.com", "A", folder="Folder1"),
+            _make_bookmark("https://b.com", "B", folder="Folder2"),
+        ]
+        idx.sync(bms, source="test")
+
+        # Add summaries
+        test_vec = np.ones(4, dtype=np.float32) / 2.0
+        for url in ["https://a.com", "https://b.com"]:
+            idx.save_enrichment(
+                url=url,
+                summary_text="summary",
+                summary_embedding=test_vec,
+                model_name="test-model",
+                content_hash="hash",
+                http_status=200,
+                fetched_at=123,
+                summarized_at=124,
+            )
+
+        # Filter by folder
+        results = idx.search("", folder="Folder1")
+        assert len(results) >= 1
+        assert "Folder1" in results[0]["folder_path"]
+
+    def test_failed_enrichment_not_used_in_blend(self, idx):
+        """Failed enrichment rows are skipped (only 'complete' used)."""
+        bms = [_make_bookmark("https://a.com", "A")]
+        idx.sync(bms, source="test")
+
+        # Mark as failed
+        idx.fail_enrichment("https://a.com", error="test error")
+
+        # Search should still work, using only base embedding
+        results = idx.search("a")
+        assert len(results) >= 1
+        # No excerpt should be included
+        assert "relevant_excerpt" not in results[0]
+
+    def test_search_with_relevant_excerpt(self, idx):
+        """include_excerpt with relevant_excerpt shows most relevant sentence."""
+        bms = [_make_bookmark("https://a.com", "A")]
+        idx.sync(bms, source="test")
+
+        summary_text = "First sentence here. Second sentence with details. Third sentence."
+        test_vec = np.ones(4, dtype=np.float32) / 2.0
+        idx.save_enrichment(
+            url="https://a.com",
+            summary_text=summary_text,
+            summary_embedding=test_vec,
+            model_name="test-model",
+            content_hash="testhash",
+            http_status=200,
+            fetched_at=123,
+            summarized_at=124,
+        )
+
+        results = idx.search("a", include_excerpt=True)
+        assert len(results) >= 1
+        # Should have relevant_excerpt with one of the sentences
+        assert "relevant_excerpt" in results[0]
+        excerpt = results[0]["relevant_excerpt"]
+        assert excerpt in [
+            "First sentence here.",
+            "Second sentence with details.",
+            "Third sentence.",
+        ]
+
+
+# ---- Phase 5: UX Improvements (Excerpt Extraction) ----
+
+from mindmark.index import _find_relevant_excerpt
+
+
+class TestRelevantExcerpt:
+    def test_empty_summary_returns_empty(self):
+        embedder_mock = MagicMock()
+        query_vec = np.ones(4, dtype=np.float32)
+        result = _find_relevant_excerpt(query_vec, "", embedder_mock)
+        assert result == ""
+
+    def test_whitespace_only_returns_empty(self):
+        embedder_mock = MagicMock()
+        query_vec = np.ones(4, dtype=np.float32)
+        result = _find_relevant_excerpt(query_vec, "   \n\t  ", embedder_mock)
+        assert result == ""
+
+    def test_single_sentence_returned_as_is(self):
+        embedder_mock = MagicMock()
+        query_vec = np.ones(4, dtype=np.float32)
+        text = "This is a single sentence."
+        result = _find_relevant_excerpt(query_vec, text, embedder_mock)
+        assert result == text
+
+    def test_long_single_sentence_truncated(self):
+        embedder_mock = MagicMock()
+        query_vec = np.ones(4, dtype=np.float32)
+        text = "x" * 300 + "."
+        result = _find_relevant_excerpt(query_vec, text, embedder_mock)
+        assert len(result) <= 200
+
+    def test_multiple_sentences_picks_best_match(self):
+        """With multiple sentences, should return the best-matching one."""
+        embedder_mock = MagicMock()
+        query_vec = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+        def fake_embed(texts):
+            dim = 4
+            vecs = np.zeros((len(texts), dim), dtype=np.float32)
+            for i, text in enumerate(texts):
+                seed = sum(ord(c) for c in text) % 100
+                rng = np.random.RandomState(seed)
+                v = rng.randn(dim).astype(np.float32)
+                v = v / (np.linalg.norm(v) + 1e-8)
+                vecs[i] = v
+            return vecs
+
+        embedder_mock.embed.side_effect = fake_embed
+
+        text = "First sentence here. Second sentence there. Third sentence too."
+        result = _find_relevant_excerpt(query_vec, text, embedder_mock)
+
+        # Should be one of the sentences
+        assert result in [
+            "First sentence here.",
+            "Second sentence there.",
+            "Third sentence too.",
+        ]
+
+    def test_no_sentence_markers_returns_first_150(self):
+        """If no sentence markers and text is too short, return as-is (up to 200)."""
+        embedder_mock = MagicMock()
+        query_vec = np.ones(4, dtype=np.float32)
+        text = "x" * 80  # No punctuation, shorter than 200
+        result = _find_relevant_excerpt(query_vec, text, embedder_mock)
+        # Unseparated text is treated as single sentence, returned up to 200 chars
+        assert result == text
+        assert len(result) == 80
+
+    def test_long_unseparated_text_truncated_to_200(self):
+        """Long text with no sentence markers gets treated as one sentence."""
+        embedder_mock = MagicMock()
+        query_vec = np.ones(4, dtype=np.float32)
+        text = "x" * 300  # No punctuation, longer than 200
+        result = _find_relevant_excerpt(query_vec, text, embedder_mock)
+        # Unseparated text is single "sentence", truncated to 200 chars
+        assert result == "x" * 200
+        assert len(result) == 200
+
+    def test_short_fragments_ignored(self):
+        """Sentence fragments < 3 chars should be skipped."""
+        embedder_mock = MagicMock()
+        query_vec = np.ones(4, dtype=np.float32)
+
+        def fake_embed(texts):
+            dim = 4
+            vecs = np.zeros((len(texts), dim), dtype=np.float32)
+            for i in range(len(texts)):
+                vecs[i] = np.ones(dim)
+            return vecs
+
+        embedder_mock.embed.side_effect = fake_embed
+
+        text = "a. b. This is a real sentence."
+        result = _find_relevant_excerpt(query_vec, text, embedder_mock)
+        # Should return the real sentence, not the fragments
+        assert "This is a real sentence" in result
+
+    def test_embedding_error_fallback(self):
+        """If embedding fails, fallback to first sentence."""
+
+        class FailingEmbedder:
+            def embed(self, texts):
+                raise RuntimeError("Embedding failed")
+
+        query_vec = np.ones(4, dtype=np.float32)
+        text = "First sentence. Second sentence."
+        result = _find_relevant_excerpt(query_vec, text, FailingEmbedder())
+        # Should return first sentence
+        assert result == "First sentence."
+
+    def test_long_excerpt_truncated_with_ellipsis(self):
+        """Excerpts longer than 200 chars should be truncated with ..."""
+        embedder_mock = MagicMock()
+        query_vec = np.ones(4, dtype=np.float32)
+
+        def fake_embed(texts):
+            dim = 4
+            vecs = np.zeros((len(texts), dim), dtype=np.float32)
+            # Make first sentence most similar
+            vecs[0] = query_vec
+            return vecs
+
+        embedder_mock.embed.side_effect = fake_embed
+
+        long_sentence = "A" * 250 + "."
+        text = long_sentence + " Short."
+        result = _find_relevant_excerpt(query_vec, text, embedder_mock)
+        # Should end with ...
+        assert result.endswith("...")
+        assert len(result) <= 200
